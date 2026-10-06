@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import boto3
+import numpy as np
 import pandas as pd
 from PIL import Image
 
@@ -11,16 +12,32 @@ TARGET_W, TARGET_H = 224, 224
 
 s3 = boto3.client("s3")
 
-def load_image(s3_uri):
+def load_image_bytes(s3_uri):
     bucket, key = s3_uri.replace("s3://", "").split("/", 1)
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    return Image.open(BytesIO(obj["Body"].read())).convert("RGB")
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+def image_stats(image):
+    """Same statistics as image_stats in src/classification/inference.py."""
+    gray = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+    width, height = image.size
+    return {
+        "width": width,
+        "height": height,
+        "aspect_ratio": width / height,
+        "brightness": float(gray.mean()),
+        "contrast": float(gray.std()),
+    }
 
 def resize_and_save_image(s3_uri, output_path):
+    """Save the 224x224 training image and return statistics of the original image."""
+    image_bytes = load_image_bytes(s3_uri)
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    # Statistics of the original image, used by the image-statistics benchmark in evaluation.py
+    stats = {**image_stats(img), "file_size": len(image_bytes)}
     # Same resize call as src/classification/inference.py, so training sees what serving sees.
     # PNG avoids a second round of JPEG compression that serving never applies.
-    img = load_image(s3_uri).resize((TARGET_W, TARGET_H))
-    img.save(output_path, format="PNG")
+    img.resize((TARGET_W, TARGET_H)).save(output_path, format="PNG")
+    return stats
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -53,11 +70,13 @@ if __name__ == "__main__":
 
     # Downloads are I/O bound, so threads give a large speedup
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        list(pool.map(resize_and_save_image, df["remote_path"], output_paths))
+        stats = pd.DataFrame(list(pool.map(resize_and_save_image, df["remote_path"], output_paths)))
 
     pd.DataFrame({
         "image": filenames,
         "label": df["label"].astype(int),
+        "source": df["source"] if "source" in df else "unknown",
         "remote_path": df["remote_path"],
+        **{column: stats[column] for column in stats.columns},
     }).to_parquet(os.path.join(args.output, "labels.parquet"), index=False)
     print(f"Saved {len(df)} records to labels.parquet")

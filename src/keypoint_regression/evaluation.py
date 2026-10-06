@@ -27,7 +27,37 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 TARGET_W, TARGET_H = 224, 224
 MODEL_DIR = "/opt/ml/processing/model"
+TRAIN_DIR = "/opt/ml/processing/train"
 BEST_MODEL_PATH = "model_best.pth"
+
+
+def keypoint_errors(pred_norm, df):
+    """NME per image and keypoint for normalized predictions of shape (N, 18).
+
+    Error per keypoint in original-image pixels, divided by the ground-truth
+    inter-ocular distance (left_eye to right_eye), so it is comparable across
+    image sizes and how large the cat's face is in the frame. Images whose two
+    eye annotations coincide have no usable scale and are excluded."""
+    pred_norm = np.asarray(pred_norm, dtype="float64").reshape(-1, len(KP_NAMES), 2)
+    gt_norm = df[KP_COLS_NORM].to_numpy(dtype="float64").reshape(-1, len(KP_NAMES), 2)
+    scale = df[["width", "height"]].to_numpy(dtype="float64")[:, None, :]
+
+    pred_px = pred_norm * scale
+    gt_px = gt_norm * scale
+    inter_ocular = np.linalg.norm(gt_px[:, 0] - gt_px[:, 1], axis=1)
+
+    valid = inter_ocular > 0
+    nme = np.linalg.norm(pred_px - gt_px, axis=2)[valid] / inter_ocular[valid, None]
+    return nme, valid
+
+
+def nme_summary(nme_per_image):
+    return {
+        "nme_mean": float(nme_per_image.mean()),
+        "nme_median": float(np.median(nme_per_image)),
+        "nme_p95": float(np.percentile(nme_per_image, 95)),
+        "failure_rate_at_0_1": float((nme_per_image > 0.1).mean()),
+    }
 
 
 class KeypointDataset(Dataset):
@@ -153,36 +183,39 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Normalized Mean Error (NME)
 # ---------------------------------------------------------------------------
-    # Error per keypoint in original-image pixels, divided by the ground-truth
-    # inter-ocular distance (left_eye to right_eye), so it is comparable across
-    # image sizes and how large the cat's face is in the frame
-    pred_norm = np.concatenate(batch_predictions).reshape(-1, len(KP_NAMES), 2)
-    gt_norm = eval_dataset.df[KP_COLS_NORM].to_numpy(dtype="float64").reshape(-1, len(KP_NAMES), 2)
-    scale = eval_dataset.df[["width", "height"]].to_numpy(dtype="float64")[:, None, :]
+    nme, valid = keypoint_errors(np.concatenate(batch_predictions), eval_dataset.df)
 
-    pred_px = pred_norm * scale
-    gt_px = gt_norm * scale
-    inter_ocular = np.linalg.norm(gt_px[:, 0] - gt_px[:, 1], axis=1)
-
-    # Images whose two eye annotations coincide have no usable scale
-    valid = inter_ocular > 0
-    nme = np.linalg.norm(pred_px - gt_px, axis=2)[valid] / inter_ocular[valid, None]
-    nme_per_image = nme.mean(axis=1)
+# ---------------------------------------------------------------------------
+# Benchmark: mean shape
+# ---------------------------------------------------------------------------
+    # Predict the average training keypoint positions for every image. The model
+    # has to beat this to show it locates the face rather than learning the average layout.
+    train_annotations = pd.read_parquet(os.path.join(TRAIN_DIR, "annotations.parquet"))
+    mean_shape = train_annotations[KP_COLS_NORM].to_numpy(dtype="float64").mean(axis=0)
+    mean_shape_pred = np.tile(mean_shape, (len(eval_dataset.df), 1))
+    mean_shape_nme, _ = keypoint_errors(mean_shape_pred, eval_dataset.df)
+    gt_norm = eval_dataset.df[KP_COLS_NORM].to_numpy(dtype="float64")
 
     report_dict = {
         "regression_metrics": {
             "mse": {"value": eval_loss},
             "rmse": {"value": float(np.sqrt(eval_loss))},
-            "nme_mean": {"value": float(nme_per_image.mean())},
-            "nme_median": {"value": float(np.median(nme_per_image))},
-            "nme_p95": {"value": float(np.percentile(nme_per_image, 95))},
-            "failure_rate_at_0_1": {"value": float((nme_per_image > 0.1).mean())},
+            **{name: {"value": value} for name, value in nme_summary(nme.mean(axis=1)).items()},
         },
         "per_keypoint_nme": {
             name: float(value) for name, value in zip(KP_NAMES, nme.mean(axis=0))
         },
         "test_samples": int(valid.sum()),
         "excluded_samples": int((~valid).sum()),
+        "benchmarks": {
+            "mean_shape": {
+                "mse": float(((mean_shape_pred - gt_norm) ** 2).mean()),
+                **nme_summary(mean_shape_nme.mean(axis=1)),
+                "per_keypoint_nme": {
+                    name: float(value) for name, value in zip(KP_NAMES, mean_shape_nme.mean(axis=0))
+                },
+            },
+        },
     }
     print(json.dumps(report_dict, indent=2))
 
