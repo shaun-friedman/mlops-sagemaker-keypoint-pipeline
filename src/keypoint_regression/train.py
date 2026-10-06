@@ -205,5 +205,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     train(args)
-    os.makedirs("/opt/ml/model/code", exist_ok=True)
-    shutil.copy("inference.py", "/opt/ml/model/code/inference.py")
+
+    # Package the serving script so the registered model deploys without repacking
+    code_dir = os.path.join(os.environ["SM_MODEL_DIR"], "code")
+    os.makedirs(code_dir, exist_ok=True)
+    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference.py"), code_dir)

@@ -80,7 +80,15 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"Unexpected keypoint column: {col}")
         kp_cols_norm = [f"{col}_norm" for col in KP_COLS]
-        records.append({"image": img_filename, **dict(zip(kp_cols_norm, kp_norm))})
+        # Original size and source image are kept so evaluation and monitoring can
+        # measure error in original pixels and resend the source image to an endpoint
+        records.append({
+            "image": img_filename,
+            "remote_path": row["remote_path"],
+            "width": w0,
+            "height": h0,
+            **dict(zip(kp_cols_norm, kp_norm)),
+        })
 
     pd.DataFrame(records).to_parquet(
         os.path.join(args.output, "annotations.parquet"), index=False

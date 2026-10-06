@@ -7,3 +7,13 @@ __pycache__/
 *.tar.gz
 model/
 data/
+
+# Local model outputs (5_Classification_Model writes metrics and weights here)
+models/
+
+# OS files
+.DS_Store
+
+# Credentials
+.env
+.aws/

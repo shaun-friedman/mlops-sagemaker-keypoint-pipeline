@@ -137,6 +137,7 @@ if __name__ == "__main__":
     model.eval()
     criterion = nn.MSELoss()
     eval_loss = 0.0
+    batch_predictions = []
     with torch.no_grad():
         for images, targets in eval_loader:
             images  = images.to(device)
@@ -144,15 +145,46 @@ if __name__ == "__main__":
             predictions = model(images)
             loss = criterion(predictions, targets)
             eval_loss += loss.item() * images.size(0)
+            batch_predictions.append(predictions.cpu().numpy())
 
     eval_loss /= len(eval_loader.dataset)
     print(f"Test Loss: {eval_loss:.6f}")
 
+# ---------------------------------------------------------------------------
+# Normalized Mean Error (NME)
+# ---------------------------------------------------------------------------
+    # Error per keypoint in original-image pixels, divided by the ground-truth
+    # inter-ocular distance (left_eye to right_eye), so it is comparable across
+    # image sizes and how large the cat's face is in the frame
+    pred_norm = np.concatenate(batch_predictions).reshape(-1, len(KP_NAMES), 2)
+    gt_norm = eval_dataset.df[KP_COLS_NORM].to_numpy(dtype="float64").reshape(-1, len(KP_NAMES), 2)
+    scale = eval_dataset.df[["width", "height"]].to_numpy(dtype="float64")[:, None, :]
+
+    pred_px = pred_norm * scale
+    gt_px = gt_norm * scale
+    inter_ocular = np.linalg.norm(gt_px[:, 0] - gt_px[:, 1], axis=1)
+
+    # Images whose two eye annotations coincide have no usable scale
+    valid = inter_ocular > 0
+    nme = np.linalg.norm(pred_px - gt_px, axis=2)[valid] / inter_ocular[valid, None]
+    nme_per_image = nme.mean(axis=1)
+
     report_dict = {
         "regression_metrics": {
             "mse": {"value": eval_loss},
+            "rmse": {"value": float(np.sqrt(eval_loss))},
+            "nme_mean": {"value": float(nme_per_image.mean())},
+            "nme_median": {"value": float(np.median(nme_per_image))},
+            "nme_p95": {"value": float(np.percentile(nme_per_image, 95))},
+            "failure_rate_at_0_1": {"value": float((nme_per_image > 0.1).mean())},
         },
+        "per_keypoint_nme": {
+            name: float(value) for name, value in zip(KP_NAMES, nme.mean(axis=0))
+        },
+        "test_samples": int(valid.sum()),
+        "excluded_samples": int((~valid).sum()),
     }
+    print(json.dumps(report_dict, indent=2))
 
     output_dir = "/opt/ml/processing/evaluation"
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
