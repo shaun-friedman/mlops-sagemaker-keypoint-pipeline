@@ -196,11 +196,19 @@ if __name__ == "__main__":
     mean_shape_nme, _ = keypoint_errors(mean_shape_pred, eval_dataset.df)
     gt_norm = eval_dataset.df[KP_COLS_NORM].to_numpy(dtype="float64")
 
+    model_nme = nme_summary(nme.mean(axis=1))
+    mean_shape_nme_summary = nme_summary(mean_shape_nme.mean(axis=1))
+
     report_dict = {
         "regression_metrics": {
             "mse": {"value": eval_loss},
             "rmse": {"value": float(np.sqrt(eval_loss))},
-            **{name: {"value": value} for name, value in nme_summary(nme.mean(axis=1)).items()},
+            **{name: {"value": value} for name, value in model_nme.items()},
+            # The pipeline's quality gate: the model's mean NME as a fraction of the
+            # mean-shape benchmark's. 1.0 would mean no better than the average layout.
+            "nme_ratio_to_mean_shape": {
+                "value": model_nme["nme_mean"] / mean_shape_nme_summary["nme_mean"]
+            },
         },
         "per_keypoint_nme": {
             name: float(value) for name, value in zip(KP_NAMES, nme.mean(axis=0))
@@ -210,7 +218,7 @@ if __name__ == "__main__":
         "benchmarks": {
             "mean_shape": {
                 "mse": float(((mean_shape_pred - gt_norm) ** 2).mean()),
-                **nme_summary(mean_shape_nme.mean(axis=1)),
+                **mean_shape_nme_summary,
                 "per_keypoint_nme": {
                     name: float(value) for name, value in zip(KP_NAMES, mean_shape_nme.mean(axis=0))
                 },
