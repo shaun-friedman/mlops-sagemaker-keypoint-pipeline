@@ -1,5 +1,6 @@
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import boto3
@@ -39,6 +40,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--split", type=str, required=True, choices=["train", "validation", "test"])
     parser.add_argument("--sample-size", type=int, required=False, default=None)
+    parser.add_argument("--workers", type=int, required=False, default=32)
     args = parser.parse_args()
 
     csv_files = [
@@ -57,20 +59,22 @@ if __name__ == "__main__":
     print(f"Processing {len(df)} rows for split=\\'{args.split}\\'")
 
     os.makedirs(args.output, exist_ok=True)
-    records = []
 
-    for idx, row in df.iterrows():
+    invalid = (df["width"] == 0) | (df["height"] == 0)
+    for idx, row in df[invalid].iterrows():
+        print(f"Skipping row {idx} — invalid dimensions w={row['width']}, h={row['height']}")
+    df = df[~invalid].reset_index(drop=True)
+
+    # Downloads are I/O bound, so threads give a large speedup
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        img_filenames = list(pool.map(
+            lambda s3_uri: resize_and_save_image(s3_uri, args.output, TARGET_W, TARGET_H),
+            df["remote_path"],
+        ))
+
+    records = []
+    for (_, row), img_filename in zip(df.iterrows(), img_filenames):
         w0, h0 = row["width"], row["height"]
-        if w0 == 0 or h0 == 0:
-            print(f"Skipping row {idx} — invalid dimensions w={w0}, h={h0}")
-            continue
-        
-        img_filename = resize_and_save_image(
-            s3_uri=row["remote_path"],
-            output_dir=args.output,
-            target_height=TARGET_H,
-            target_width=TARGET_W,
-        )
         kp_norm = []
         for col in KP_COLS:
             if col.endswith("_x"):
@@ -80,7 +84,15 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"Unexpected keypoint column: {col}")
         kp_cols_norm = [f"{col}_norm" for col in KP_COLS]
-        records.append({"image": img_filename, **dict(zip(kp_cols_norm, kp_norm))})
+        # Original size and source image are kept so evaluation and monitoring can
+        # measure error in original pixels and resend the source image to an endpoint
+        records.append({
+            "image": img_filename,
+            "remote_path": row["remote_path"],
+            "width": w0,
+            "height": h0,
+            **dict(zip(kp_cols_norm, kp_norm)),
+        })
 
     pd.DataFrame(records).to_parquet(
         os.path.join(args.output, "annotations.parquet"), index=False
